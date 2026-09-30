@@ -1,0 +1,457 @@
+name: Check Yarn Hardening
+
+# Supply-chain hardening for yarn projects. Enforced org-wide as a required
+# workflow via a github_organization_ruleset in `tcc` (root-modules/github).
+#
+# Scope: repos that can carry BOTH flags, i.e. Yarn >= 4.10:
+#   - enableScripts: false      -> no third-party postinstall scripts at install
+#   - npmMinimalAgeGate: <dur>   -> refuse package versions younger than <dur>
+# Repos on Yarn < 4.10 are legacy (see LEGACY_MODE).
+#
+# SECURITY: never switch this to `pull_request_target` — the analysed repo code
+# is untrusted and must not get access to secrets.
+# Known limitation: a YARN_* override set in another pipeline or in CI/org
+# settings (not in a repo file) cannot be seen statically.
+
+on:
+  pull_request:
+    branches:
+      - master
+      - main
+  # Required checks must also report on the merge queue, or they block it.
+  merge_group:
+    types: [checks_requested]
+
+permissions: {}
+
+concurrency:
+  group: check-yarn-hardening-${{ github.event.pull_request.number || github.ref }}
+  # Never cancel a merge-queue run.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  yarn-hardening:
+    # Do not rename: the check name can be referenced by rulesets.
+    name: Check yarn hardening
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      # Minimum acceptable npmMinimalAgeGate (yarn duration, e.g. 3d, 1w).
+      # TODO(secu): confirm the target value with the security team / Julien D.
+      MIN_AGE: '3d'
+      # Yarn < 4.10 repos: 'warn' during migration, 'fail' once done.
+      LEGACY_MODE: 'fail'
+      # Comma-separated paths to ignore (e.g. test fixtures).
+      EXCLUDE_PATHS: ''
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: '3.11'
+
+      - name: Install PyYAML
+        run: pip install 'pyyaml==6.0.2'
+
+      - name: Verify yarn supply-chain hardening
+        run: |
+          set -euo pipefail
+          cat > "${RUNNER_TEMP}/check_yarn_hardening.py" <<'PY'
+          """Verifie le durcissement supply-chain des projets yarn (Berry >= 4.10)."""
+          import json
+          import os
+          import re
+          import sys
+          from pathlib import Path
+
+          import yaml
+
+          MIN_AGE = os.environ.get("MIN_AGE", "3d").strip()
+          LEGACY_MODE = os.environ.get("LEGACY_MODE", "fail").strip().lower()  # warn | fail
+          EXCLUDE_PATHS = [p.strip().strip("/") for p in os.environ.get("EXCLUDE_PATHS", "").split(",") if p.strip()]
+          SELF_WORKFLOW = "check-yarn-hardening.yaml"
+          MIN_VERSION = (4, 10)
+          DOC_URL = "https://github.com/padoa/ci-tools/blob/master/.github/workflows/check-yarn-hardening.yaml"
+
+          SKIP_DIRS = {".git", "node_modules", ".yarn", "dist", "build", "coverage", ".next", ".nuxt", "vendor"}
+          _UNITS = {"w": 604800, "d": 86400, "h": 3600, "m": 60, "s": 1}
+
+          ENV_OVERRIDE = re.compile(
+              r"\b(YARN_ENABLE_SCRIPTS|YARN_NPM_MINIMAL_AGE_GATE|YARN_NPM_PREAPPROVED_PACKAGES)\b\s*[:=]\s*(\S*)"
+          )
+          CLI_OVERRIDE = re.compile(
+              r"\byarn\s+config\s+set\s+(enableScripts|npmMinimalAgeGate|npmPreapprovedPackages)\b\s*(\S*)"
+          )
+          OVERRIDE_KEYS = {
+              "YARN_ENABLE_SCRIPTS": "enableScripts",
+              "YARN_NPM_MINIMAL_AGE_GATE": "npmMinimalAgeGate",
+              "YARN_NPM_PREAPPROVED_PACKAGES": "npmPreapprovedPackages",
+          }
+
+
+          # ---------------------------------------------------------------- reporting
+          def _esc_data(s):
+              return str(s).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
+          def _esc_prop(s):
+              return _esc_data(s).replace(":", "%3A").replace(",", "%2C")
+
+
+          class Report:
+              def __init__(self):
+                  self.errors = 0
+                  self.warnings = 0
+
+              def _emit(self, level, msg, file=None, line=None):
+                  props = []
+                  if file:
+                      props.append(f"file={_esc_prop(str(file))}")
+                  if line:
+                      props.append(f"line={int(line)}")
+                  head = f"::{level} {','.join(props)}::" if props else f"::{level}::"
+                  print(head + _esc_data(msg))
+
+              def error(self, msg, file=None, line=None):
+                  self.errors += 1
+                  self._emit("error", msg, file, line)
+
+              def warning(self, msg, file=None, line=None):
+                  self.warnings += 1
+                  self._emit("warning", msg, file, line)
+
+              def notice(self, msg, file=None, line=None):
+                  self._emit("notice", msg, file, line)
+
+
+          # ---------------------------------------------------------------- helpers
+          def _unquote(v):
+              v = str(v).strip()
+              if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+                  return v[1:-1]
+              return v
+
+
+          def parse_duration(value):
+              """Yarn duration string ('3d', '72h', '1w 2d') -> secondes.
+              Un entier nu est refuse (ambigu) : une unite explicite est requise."""
+              if value is None:
+                  return None
+              text = _unquote(value).strip().lower()
+              if not text:
+                  return None
+              matches = re.findall(r"(\d+)\s*([wdhms])", text)
+              if not matches or re.sub(r"(\d+)\s*([wdhms])|\s+", "", text):
+                  return None
+              return sum(int(n) * _UNITS[u] for n, u in matches)
+
+
+          def line_of(text, key):
+              for i, raw in enumerate(text.splitlines(), 1):
+                  if re.match(rf"^{re.escape(key)}\s*:", raw):
+                      return i
+              return 1
+
+
+          def _excluded(rel):
+              rel = rel.as_posix().strip("/")
+              return any(rel == p or rel.startswith(p + "/") for p in EXCLUDE_PATHS)
+
+
+          def iter_files(root):
+              for dirpath, dirnames, filenames in os.walk(root):
+                  rel_dir = Path(dirpath).relative_to(root)
+                  dirnames[:] = sorted(
+                      d for d in dirnames if d not in SKIP_DIRS and not _excluded(rel_dir / d)
+                  )
+                  for f in sorted(filenames):
+                      yield rel_dir / f
+
+
+          def find_projects(root):
+              """Racine de projet = dossier avec yarn.lock. Sinon, si un .yarnrc.yml
+              existe a la racine sans aucun yarn.lock (zero-install), la racine."""
+              locks = {p.parent for p in iter_files(root) if p.name == "yarn.lock"}
+              if locks:
+                  return sorted(locks)
+              if (root / ".yarnrc.yml").exists():
+                  return [Path(".")]
+              return []
+
+
+          def ancestors(project):
+              chain = [project]
+              for parent in project.parents:
+                  chain.append(parent)
+                  if parent == Path("."):
+                      break
+              return chain
+
+
+          def detect_yarn_version(root, project):
+              """((major, minor), source) ou (None, None)."""
+              for cur in ancestors(project):
+                  pkg = root / cur / "package.json"
+                  if pkg.exists():
+                      try:
+                          pm = json.loads(pkg.read_text(encoding="utf-8")).get("packageManager", "") or ""
+                      except (json.JSONDecodeError, UnicodeDecodeError, AttributeError):
+                          pm = ""
+                      m = re.match(r"yarn@(\d+)\.(\d+)", str(pm))
+                      if m:
+                          return (int(m.group(1)), int(m.group(2))), "packageManager"
+                  releases = root / cur / ".yarn" / "releases"
+                  if releases.is_dir():
+                      vers = []
+                      for f in releases.glob("yarn-*.cjs"):
+                          m = re.match(r"yarn-(\d+)\.(\d+)", f.name)
+                          if m:
+                              vers.append((int(m.group(1)), int(m.group(2))))
+                      if vers:
+                          return max(vers), ".yarn/releases"
+              lock = root / project / "yarn.lock"
+              if lock.exists():
+                  head = lock.read_text(encoding="utf-8", errors="replace")[:512]
+                  if "yarn lockfile v1" in head and "__metadata" not in head:
+                      return (1, 0), "yarn.lock (v1)"
+              return None, None
+
+
+          def merged_yarnrc(root, project):
+              """Merge .yarnrc.yml racine -> projet (l'enfant l'emporte). Renvoie
+              (cfg, texte_du_yarnrc_projet)."""
+              merged = {}
+              own_text = ""
+              for cur in reversed(ancestors(project)):
+                  rc = root / cur / ".yarnrc.yml"
+                  if rc.exists():
+                      text = rc.read_text(encoding="utf-8")
+                      try:
+                          data = yaml.safe_load(text) or {}
+                      except yaml.YAMLError:
+                          data = {}
+                      if isinstance(data, dict):
+                          merged.update(data)
+                      if cur == project:
+                          own_text = text
+              return merged, own_text
+
+
+          def is_false(value):
+              return value is False or str(value).strip().strip("\"'").lower() == "false"
+
+
+          # ---------------------------------------------------------------- checks
+          def check_project(root, project, report, min_s):
+              rel = project.as_posix()
+              row = {"project": rel, "version": "?", "scripts": "—", "gate": "—", "status": "✅"}
+              pkg_file = (project / "package.json").as_posix()
+
+              ver, source = detect_yarn_version(root, project)
+              if ver is None:
+                  report.error(
+                      f"[{rel}] version yarn indeterminable — declarer `packageManager: \"yarn@4.x.y\"` "
+                      "dans package.json (un projet yarn sans version ne doit pas passer silencieusement).",
+                      pkg_file,
+                  )
+                  row["status"] = "❌ version inconnue"
+                  return row
+
+              label = "1.x" if ver == (1, 0) else f"{ver[0]}.{ver[1]}"
+              row["version"] = f"{label} ({source})"
+              if ver < MIN_VERSION:
+                  msg = (
+                      f"[{rel}] Yarn {label} < 4.10 — mettre a jour Yarn en 4.10.0 ou plus "
+                      "(npmMinimalAgeGate requiert >= 4.10)."
+                  )
+                  if LEGACY_MODE == "fail":
+                      report.error(msg, pkg_file)
+                      row["status"] = "❌ legacy"
+                  else:
+                      report.warning(msg, pkg_file)
+                      row["status"] = "⚠️ legacy"
+                  return row
+
+              rc_file = (project / ".yarnrc.yml").as_posix()
+              cfg, text = merged_yarnrc(root, project)
+              if not text and not (root / project / ".yarnrc.yml").exists() and not cfg:
+                  report.error(
+                      f"[{rel}] `.yarnrc.yml` absent — ajouter `enableScripts: false` et "
+                      f"`npmMinimalAgeGate: \"{MIN_AGE}\"`.",
+                      pkg_file,
+                  )
+                  row["status"] = "❌"
+                  return row
+
+              before = report.errors
+
+              # enableScripts
+              if "enableScripts" not in cfg:
+                  report.error(f"[{rel}] `enableScripts` absent — ajouter `enableScripts: false`.", rc_file, line_of(text, "enableScripts"))
+              elif not is_false(cfg["enableScripts"]):
+                  report.error(f"[{rel}] `enableScripts` doit valoir false (trouve: {cfg['enableScripts']!r}).", rc_file, line_of(text, "enableScripts"))
+              else:
+                  row["scripts"] = "false"
+
+              # npmMinimalAgeGate
+              gate = cfg.get("npmMinimalAgeGate")
+              gate_line = line_of(text, "npmMinimalAgeGate")
+              if "npmMinimalAgeGate" not in cfg:
+                  report.error(f"[{rel}] `npmMinimalAgeGate` absent — ajouter `npmMinimalAgeGate: \"{MIN_AGE}\"`.", rc_file, gate_line)
+              else:
+                  gate_s = parse_duration(gate)
+                  if gate_s is None:
+                      report.error(f"[{rel}] `npmMinimalAgeGate` illisible/ambigu ({gate!r}) — utiliser une duree avec unite (ex. \"{MIN_AGE}\").", rc_file, gate_line)
+                  elif min_s is not None and gate_s < min_s:
+                      report.error(f"[{rel}] `npmMinimalAgeGate` ({gate}) < minimum requis ({MIN_AGE}).", rc_file, gate_line)
+                  else:
+                      row["gate"] = _unquote(gate)
+
+              # npmPreapprovedPackages : toute exemption contourne l'age gate -> refus
+              pre = cfg.get("npmPreapprovedPackages")
+              if pre:
+                  if not isinstance(pre, list):
+                      pre = [pre]
+                  report.error(
+                      f"[{rel}] `npmPreapprovedPackages` exempte des paquets de l'age gate ({pre}) — "
+                      "interdit (contourne la protection) ; a retirer ou a justifier aupres de la secu.",
+                      rc_file, line_of(text, "npmPreapprovedPackages"),
+                  )
+
+              # npmScopes.<scope>.npmMinimalAgeGate : un scope ne doit pas affaiblir le gate
+              scopes = cfg.get("npmScopes")
+              if isinstance(scopes, dict):
+                  for scope, sconf in scopes.items():
+                      if not isinstance(sconf, dict) or "npmMinimalAgeGate" not in sconf:
+                          continue
+                      sg = parse_duration(sconf.get("npmMinimalAgeGate"))
+                      if sg is None or (min_s is not None and sg < min_s):
+                          report.error(
+                              f"[{rel}] `npmScopes.{scope}.npmMinimalAgeGate` ({sconf.get('npmMinimalAgeGate')!r}) "
+                              f"contourne/affaiblit l'age gate (< {MIN_AGE}).",
+                              rc_file, line_of(text, "npmScopes"),
+                          )
+
+              # dependenciesMeta.<pkg>.built: true : reactive des build scripts
+              dep_meta = cfg.get("dependenciesMeta")
+              if isinstance(dep_meta, dict):
+                  built = [n for n, m in dep_meta.items() if isinstance(m, dict) and m.get("built") is True]
+                  if built:
+                      report.warning(
+                          f"[{rel}] `dependenciesMeta` reactive les build scripts pour {built} "
+                          "(built: true) malgre enableScripts:false — a verifier en review.",
+                          rc_file, line_of(text, "dependenciesMeta"),
+                      )
+
+              if report.errors > before:
+                  row["status"] = "❌"
+              return row
+
+
+          def check_overrides(root, report, min_s):
+              for rel in iter_files(root):
+                  name = rel.name
+                  in_github = rel.parts[:1] == (".github",)
+                  if name == SELF_WORKFLOW:
+                      continue
+                  if not (
+                      (in_github and rel.suffix in {".yml", ".yaml", ".sh"})
+                      or rel.suffix in {".sh", ".bash", ".env"}
+                      or name.startswith("Dockerfile")
+                      or name in {"Makefile", ".envrc", ".env"}
+                  ):
+                      continue
+                  try:
+                      lines = (root / rel).read_text(encoding="utf-8", errors="replace").splitlines()
+                  except OSError:
+                      continue
+                  for lineno, line in enumerate(lines, 1):
+                      for m in list(ENV_OVERRIDE.finditer(line)) + list(CLI_OVERRIDE.finditer(line)):
+                          key = OVERRIDE_KEYS.get(m.group(1), m.group(1))
+                          value = _unquote(m.group(2).rstrip(";&|"))
+                          _check_override(report, rel.as_posix(), lineno, key, value, min_s)
+
+
+          def _check_override(report, file, lineno, key, value, min_s):
+              if key == "enableScripts":
+                  if value.lower() not in {"false", "0"}:
+                      report.error(f"Surcharge de `enableScripts` ({value or '?'}) hors .yarnrc.yml.", file, lineno)
+              elif key == "npmMinimalAgeGate":
+                  s = parse_duration(value)
+                  if s is None or (min_s is not None and s < min_s):
+                      report.error(f"Surcharge de `npmMinimalAgeGate` ({value or '?'}) < {MIN_AGE} hors .yarnrc.yml.", file, lineno)
+              else:
+                  report.error(f"Surcharge de `{key}` hors .yarnrc.yml (contourne le durcissement).", file, lineno)
+
+
+          # ---------------------------------------------------------------- summary
+          def write_summary(report, rows):
+              path = os.environ.get("GITHUB_STEP_SUMMARY")
+              if not path:
+                  return
+              out = ["## Yarn supply-chain hardening", ""]
+              if rows:
+                  out += ["| Projet | Yarn | enableScripts | npmMinimalAgeGate | Statut |", "|---|---|---|---|---|"]
+                  out += [f"| `{r['project']}` | {r['version']} | {r['scripts']} | {r['gate']} | {r['status']} |" for r in rows]
+              else:
+                  out.append("Aucun projet yarn detecte.")
+              out += ["", f"**{report.errors} erreur(s), {report.warnings} avertissement(s).** Minimum requis : `{MIN_AGE}`."]
+              if report.errors:
+                  out.append(f"\nConf attendue : {DOC_URL}")
+              try:
+                  with open(path, "a", encoding="utf-8") as fh:
+                      fh.write("\n".join(out) + "\n")
+              except OSError:
+                  pass
+
+
+          def main():
+              root = Path(os.environ.get("CHECK_ROOT", ".")).resolve()
+              report = Report()
+
+              min_s = parse_duration(MIN_AGE)
+              if min_s is None:
+                  report.error(f"MIN_AGE invalide dans le workflow ({MIN_AGE!r}).")
+                  return 1
+              if LEGACY_MODE not in {"warn", "fail"}:
+                  report.error(f"LEGACY_MODE invalide ({LEGACY_MODE!r}) : attendu `warn` ou `fail`.")
+                  return 1
+
+              projects = find_projects(root)
+              if not projects:
+                  print("Aucun projet yarn detecte : rien a verifier.")
+                  write_summary(report, [])
+                  return 0
+
+              print("Projets yarn : " + ", ".join(p.as_posix() for p in projects))
+              rows = [check_project(root, p, report, min_s) for p in projects]
+              check_overrides(root, report, min_s)
+              write_summary(report, rows)
+
+              if report.errors:
+                  print(f"\n{report.errors} erreur(s). Conf attendue : {DOC_URL}")
+                  return 1
+              print(f"Conf yarn durcie ({report.warnings} avertissement(s)).")
+              print("Note: une surcharge YARN_* d'un autre pipeline / des parametres CI-org n'est pas visible statiquement.")
+              return 0
+
+
+          if __name__ == "__main__":
+              try:
+                  sys.exit(main())
+              except Exception as exc:  # fail closed
+                  print(f"::error::Erreur interne du check ({type(exc).__name__}) : {_esc_data(exc)}")
+                  sys.exit(2)
+          PY
+          # -I : mode isole (ignore le site utilisateur), -B : pas de .pyc
+          python3 -I -B "${RUNNER_TEMP}/check_yarn_hardening.py"
